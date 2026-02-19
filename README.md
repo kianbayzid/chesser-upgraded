@@ -5,6 +5,7 @@ Lichess Popular Moves vs Stockfish Best Response Analyzer:
   * Recursively explores the opening tree
   * Saves every variation as a PGN
   * Supports resume capability with progress caching
+
 Features:
   * Queries Lichess Opening Explorer API
   * Uses Stockfish (UCI engine) for best responses
@@ -14,6 +15,7 @@ Features:
   * Outputs structured JSON summary
   * Creates a tree-view text summary
   * Caching to avoid re-analyzing positions
+
 Requirements:
   * pip install python-chess
   * pip install requests
