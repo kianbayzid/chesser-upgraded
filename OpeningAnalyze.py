@@ -31,8 +31,14 @@ class LichessStockfishAnalyzer:
         self.all_variations = []
         # Cache: maps "fen + popular_move_uci" to the best response we already computed
         self.analyzed_positions: Dict[str, Dict] = {}
-        # Track which FENs we've already fully explored (all popular moves processed)
-        self.fully_explored_fens: Set[str] = set()
+        # Track which FENs we've already fully explored, mapped to the min_games
+        # threshold used. A position explored at threshold T is complete for any
+        # threshold >= T, but must be revisited if the threshold is lowered.
+        self.fully_explored_fens: Dict[str, int] = {}
+        # Counts failed Lichess requests, so positions under a failure aren't marked explored
+        self.fetch_errors = 0
+        # Optional Lichess API token (set LICHESS_TOKEN env var if requests get 401)
+        self.lichess_token = os.environ.get("LICHESS_TOKEN")
 
     def _cache_key(self, fen: str, move_uci: str) -> str:
         """Create a cache key from a FEN and the popular move played."""
@@ -48,6 +54,8 @@ class LichessStockfishAnalyzer:
         - variation_counter: the last variation number used
         - all_variations: list of all previously saved variations
         """
+        full_path = os.path.abspath(progress_file)
+        print(f"Progress file: {full_path}")
         if not os.path.exists(progress_file):
             print("No previous progress found. Starting fresh.")
             return
@@ -57,7 +65,16 @@ class LichessStockfishAnalyzer:
                 data = json.load(f)
 
             self.analyzed_positions = data.get("analyzed_positions", {})
-            self.fully_explored_fens = set(data.get("fully_explored_fens", []))
+            # "explored_positions" is the current key. Older "fully_explored_fens"
+            # data may contain positions wrongly marked done (failed requests or a
+            # different threshold), so it is ignored. Stockfish results are still reused.
+            explored = data.get("explored_positions")
+            if not isinstance(explored, dict):
+                if "fully_explored_fens" in data:
+                    print("Ignoring old explored-position data; positions will be re-checked "
+                          "(cached Stockfish results are reused).")
+                explored = {}
+            self.fully_explored_fens = explored
             self.variation_counter = data.get("variation_counter", 0)
             self.all_variations = data.get("all_variations", [])
 
@@ -71,7 +88,7 @@ class LichessStockfishAnalyzer:
         """Save current analysis progress to disk."""
         data = {
             "analyzed_positions": self.analyzed_positions,
-            "fully_explored_fens": list(self.fully_explored_fens),
+            "explored_positions": self.fully_explored_fens,
             "variation_counter": self.variation_counter,
             "all_variations": self.all_variations,
         }
@@ -83,8 +100,8 @@ class LichessStockfishAnalyzer:
         self.engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
         # Increase CPU and RAM usage
         self.engine.configure({
-            "Threads": 8,
-            "Hash": 2048
+            "Threads": 14,
+            "Hash": 16384
         })
         return self
         
@@ -93,7 +110,7 @@ class LichessStockfishAnalyzer:
         if self.engine:
             self.engine.quit()
     
-    def get_lichess_moves(self, board: chess.Board, top_n: int = 10) -> List[Dict]:
+    def get_lichess_moves(self, board: chess.Board, top_n: int = 10) -> Optional[List[Dict]]:
         """
         Get the most common moves from Lichess opening database.
         
@@ -102,7 +119,7 @@ class LichessStockfishAnalyzer:
             top_n: Number of top moves to retrieve
             
         Returns:
-            List of move data from Lichess
+            List of move data from Lichess, or None if the request failed
         """
         fen = board.fen()
         params = {
@@ -112,8 +129,20 @@ class LichessStockfishAnalyzer:
             'moves': top_n
         }
         
+        headers = {}
+        if self.lichess_token:
+            headers['Authorization'] = f"Bearer {self.lichess_token}"
+
         try:
-            response = requests.get(self.lichess_base_url, params=params)
+            response = None
+            for attempt in range(3):
+                response = requests.get(self.lichess_base_url, params=params,
+                                        headers=headers, timeout=30)
+                if response.status_code == 429:
+                    print("Lichess rate limit hit (429). Waiting 60 seconds...")
+                    time.sleep(60)
+                    continue
+                break
             response.raise_for_status()
             data = response.json()
             
@@ -134,9 +163,10 @@ class LichessStockfishAnalyzer:
             
             return moves
             
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             print(f"Error fetching Lichess data: {e}")
-            return []
+            self.fetch_errors += 1
+            return None
         finally:
             # Rate limiting (moved into finally so it always runs)
             time.sleep(0.5)
@@ -237,18 +267,24 @@ class LichessStockfishAnalyzer:
         current_path = self.get_move_path_string(move_history)
         current_fen = board.fen()
 
-        # If we've already fully explored this position, skip entirely
-        if current_fen in self.fully_explored_fens:
+        # If we've already fully explored this position at this threshold or lower, skip
+        explored_at = self.fully_explored_fens.get(current_fen)
+        if explored_at is not None and explored_at <= self.min_games:
             print(f"\n{indent}Skipping fully explored position: {current_path}")
             return
 
         # Get popular moves from Lichess
         print(f"\n{indent}Analyzing position after: {current_path}")
+        errors_before = self.fetch_errors
         lichess_moves = self.get_lichess_moves(board, top_n=5)
-        
+
+        if lichess_moves is None:
+            print(f"{indent}Lichess request failed - NOT marking this position as explored")
+            return
+
         if not lichess_moves:
             print(f"{indent}No more moves in database (< {self.min_games} games)")
-            self.fully_explored_fens.add(current_fen)
+            self.fully_explored_fens[current_fen] = self.min_games
             self.save_progress()
             return
         
@@ -338,8 +374,13 @@ class LichessStockfishAnalyzer:
             else:
                 print(f"{indent}  Could not find best response")
 
-        # All popular moves for this position have been processed
-        self.fully_explored_fens.add(current_fen)
+        # All popular moves for this position have been processed.
+        # Only mark it complete if nothing underneath it failed to fetch.
+        if self.fetch_errors == errors_before:
+            self.fully_explored_fens[current_fen] = self.min_games
+        else:
+            print(f"{indent}Some Lichess requests failed under {current_path} - "
+                  f"will retry these on the next run")
         self.save_progress()
     
     def analyze_position(self, pgn_moves: str) -> None:
@@ -395,9 +436,9 @@ class LichessStockfishAnalyzer:
 
 def main():
     # Configuration
-    STOCKFISH_PATH = r"C:\Users\KianB\Desktop\stockfish\stockfish-windows-x86-64-avx2.exe"  # Update this path
-    STARTING_POSITION = "1. Nf3 d5 2. g3"
-    MIN_GAMES = 500  # Minimum games required to analyze a position
+    STOCKFISH_PATH = r"E:\stockfish\stockfish-windows-x86-64-avx2.exe"  # Update this path
+    STARTING_POSITION = "1. e4 c6"
+    MIN_GAMES = 15  # Minimum games required to analyze a position
     
     print("Lichess Popular Moves vs Stockfish Best Response Analyzer")
     print("Recursive Deep Analysis Version (with Resume Support)")
